@@ -1,0 +1,2 @@
+# Only the client needs this; the server uses the Python standard library only.
+pygame-ce>=2.5
