@@ -65,6 +65,7 @@ class LoginScene(Scene):
         x, w = 724, 452
         self.mode = self.add(ui.Segmented(x + 32, 168, w - 64, 44, [("login", "Log in"), ("register", "Register")],
                                           "login", self._on_mode, size=16))
+        self.tls = self.add(ui.Toggle(x + 200, 220, w - 232, 26, "Encrypted (TLS)", True))
         self.host = self.add(ui.TextInput(x + 32, 252, 268, 44, "Server address", value=host, max_len=60,
                                           on_submit=self.submit))
         self.port = self.add(ui.TextInput(x + 312, 252, w - 344, 44, "Port", value=str(port), max_len=5,
@@ -75,13 +76,57 @@ class LoginScene(Scene):
         self.confirm = self.add(ui.TextInput(x + 32, 486, w - 64, 44, "Repeat password", secret=True,
                                              max_len=64, on_submit=self.submit))
         self.button = self.add(ui.Button(x + 32, 500, w - 64, 56, "Log in", self.submit, size=19))
+        # LAN discovery (UDP broadcast)
+        self.servers = self.add(ui.ListView(112, 414, 508, 226, 56, self._draw_server,
+                                            key=lambda s: (s["host"], s["port"]), on_select=self._pick,
+                                            on_activate=self._pick))
+        self.scan_btn = self.add(ui.Button(500, 352, 120, 44, "Scan", self.scan, "light", 14))
+        self.scanning = False
+        self.scanned = False
         self.message = ("", ui.MUTED)
         self._on_mode("login")
 
     def on_enter(self):
         self.message = ("", ui.MUTED)
         ui.set_focus(self.user if not self.user.text else self.password)
+        if not self.scanned:
+            self.scan()
 
+    # ----------------------------------------------------------- discovery
+    def scan(self):
+        if not self.scanning:
+            self.scanning = True
+            self.scanned = True
+            self.app.start_discovery()
+
+    def on_discovered(self, servers):
+        self.scanning = False
+        self.servers.set_items(servers)
+
+    def _pick(self, server):
+        self.host.set(server["host"])
+        self.port.set(str(server["port"]))
+        self.tls.value = bool(server.get("tls"))
+        name = server.get("name", "?")
+        self.message = (f"Server \"{name}\" selected - now log in.", ui.GREEN_DARK)
+        ui.set_focus(self.user if not self.user.text else self.password)
+
+    def _draw_server(self, surf, s, r, selected, hovered):
+        x, y, w, h = r
+        if selected:
+            ui.rect(surf, (219, 234, 254), (x, y + 3, w - 8, h - 6), 12)
+        elif hovered:
+            ui.rect(surf, ui.CARD_ALT, (x, y + 3, w - 8, h - 6), 12)
+        ui.text(surf, s.get("name", "server"), x + 14, y + 9, 16, ui.INK, bold=True)
+        local = " (this computer)" if s["host"].startswith("127.") else ""
+        ui.text(surf, f"{s['host']}:{s['port']}{local}   ·   {s.get('players', 0)} online   ·   "
+                      f"{s.get('open_rooms', 0)} open room(s)", x + 14, y + 32, 13, ui.MUTED)
+        label, color = ("TLS", ui.GREEN) if s.get("tls") else ("plain", ui.ORANGE)
+        cw = ui.text_width(label, 12, True) + 20
+        ui.rect(surf, color, (x + w - 20 - cw, y + 17, cw, 22), 11)
+        ui.text(surf, label, x + w - 20 - cw / 2, y + 28, 12, ui.WHITE, bold=True, anchor="center")
+
+    # --------------------------------------------------------------- form
     def _on_mode(self, mode):
         register = mode == "register"
         self.confirm.visible = register
@@ -109,6 +154,7 @@ class LoginScene(Scene):
             error = "The two passwords do not match"
         if error:
             return self.show_error(error)
+        self.app.use_tls = self.tls.value
         if self.mode.value == "register":
             self.message = ("Creating account...", ui.MUTED)
             self.app.register(host, port, user, pw)
@@ -127,32 +173,36 @@ class LoginScene(Scene):
         else:
             self.show_error(msg["msg"])
 
+    def update(self, dt, pos):
+        self.scan_btn.enabled = not self.scanning
+        self.scan_btn.label = "Scanning..." if self.scanning else "Scan"
+        super().update(dt, pos)
+
     def draw(self, surf, dt):
         now = time.monotonic()
-        # left side: title and a little animated team
-        ui.text(surf, "Co-op Block", 96, 150, 64, ui.WHITE, bold=True)
-        ui.text(surf, "Adventure", 96, 222, 64, ui.GOLD, bold=True)
-        ui.text(surf, "協力方塊大冒險", 100, 310, 26, (199, 210, 254), bold=True)
-        ui.text(surf, "A 2-4 player online co-op puzzle platformer.", 100, 356, 18, (224, 231, 255))
-        ui.text(surf, "Stack up, push together, hold the gates - and get EVERYONE out.", 100, 384, 18,
-                (224, 231, 255))
-        base_y = 600
-        ui.rect(surf, (74, 160, 70), (96, base_y, 470, 16), 6)
-        ui.rect(surf, (55, 65, 81), (96, base_y + 12, 470, 26), 6)
-        for i, (cx, color) in enumerate(((150, 0), (240, 1), (240, 2), (360, 3))):
-            stack = 1 if i == 2 else 0
-            hop = abs(math.sin(now * 2.2 + i)) * (16 if i in (0, 3) else 0)
-            size = 56
-            y = base_y - size * (stack + 1) - hop
-            ui.block_character(surf, cx, y, size, color, facing=1 if i < 2 else -1,
-                               look_up=1.0 if stack else 0.0, blink=(now + i) % 3.5 < 0.13,
-                               squash=-0.05 if hop > 8 else 0.0)
-        kx, ky = 470, 520 + 6 * math.sin(now * 3)
-        ui.circle(surf, (161, 98, 7), (kx, ky), 14)
-        ui.circle(surf, ui.GOLD, (kx, ky), 11)
-        ui.circle(surf, (161, 98, 7), (kx, ky), 4)
-        ui.rect(surf, ui.GOLD, (kx + 10, ky - 3, 26, 7))
-        ui.rect(surf, ui.GOLD, (kx + 28, ky + 2, 6, 11))
+        # left side: title, a little animated team, and the LAN server list
+        ui.text(surf, "Co-op Block", 96, 64, 60, ui.WHITE, bold=True)
+        ui.text(surf, "Adventure", 96, 132, 60, ui.GOLD, bold=True)
+        ui.text(surf, "協力方塊大冒險", 100, 214, 24, (199, 210, 254), bold=True)
+        ui.text(surf, "A 2-4 player online co-op puzzle platformer.", 100, 254, 17, (224, 231, 255))
+        ui.text(surf, "Stack up, push together, and get EVERYONE out.", 100, 280, 17, (224, 231, 255))
+        base_y = 220
+        ui.rect(surf, (74, 160, 70), (452, base_y, 190, 10), 4)
+        for i, (cx, color, stack) in enumerate(((470, 0, 0), (530, 1, 0), (530, 2, 1), (594, 3, 0))):
+            hop = abs(math.sin(now * 2.2 + i)) * (12 if i in (0, 3) else 0)
+            size = 40
+            ui.block_character(surf, cx, base_y - size * (stack + 1) - hop, size, color,
+                               facing=1 if i < 2 else -1, look_up=1.0 if stack else 0.0,
+                               blink=(now + i) % 3.5 < 0.13)
+
+        ui.card(surf, (96, 336, 540, 320), radius=22)
+        ui.text(surf, "Servers on this WiFi", 116, 352, 19, ui.INK, bold=True)
+        ui.text(surf, "found automatically with a UDP broadcast", 116, 378, 13, ui.MUTED)
+        if not self.servers.items:
+            msg = "Searching the local network..." if self.scanning else \
+                "No server found. Start run_server.py on this network,\nor type the server address on the right."
+            for i, part in enumerate(msg.split("\n")):
+                ui.text(surf, part, 366, 500 + i * 22, 14, ui.FAINT, anchor="center")
 
         # right side: the form card
         ui.card(surf, (724, 96, 452, 560 if self.mode.value == "register" else 482), radius=24)
@@ -161,7 +211,7 @@ class LoginScene(Scene):
         ui.text(surf, "Account", 756, 306, 13, ui.MUTED, bold=True)
         msg, color = self.message
         if msg:
-            for i, part in enumerate(ui.wrap(msg, 15, 388)[:2]):
+            for i, part in enumerate(ui.wrap(msg, 15, 388)[:3]):
                 ui.text(surf, part, 950, self.button.y + 72 + i * 20, 15, color, anchor="midtop")
         super().draw(surf, dt)
 
@@ -381,6 +431,8 @@ class RoomScene(Scene):
         super().__init__(app)
         self.game = GameView(app)
         self.leave_btn = self.add(ui.Button(1124, 14, 132, 46, "Leave", self._leave, "light", 15))
+        self.invite_btn = self.add(ui.Button(966, 14, 146, 46, "Invite friends",
+                                             lambda: app.open_modal(InviteDialog(app)), "warning", 15))
         self.cards: list[LevelCard] = []
         self.ready_btn = self.add(ui.Button(ORIGIN[0] + WORLD_W / 2 - 130, ORIGIN[1] + 432, 260, 58, "I'm ready!",
                                             self._toggle_ready, "success", 19))
@@ -452,6 +504,8 @@ class RoomScene(Scene):
         for card in self.cards:
             card.visible = not in_game
         self.ready_btn.visible = not in_game
+        room = self.app.room or {}
+        self.invite_btn.visible = room.get("phase") == "waiting" and room.get("missing", 0) > 0
         me = self._me()
         if me:
             self.ready_btn.label = "Cancel ready" if me["ready"] else "I'm ready!"
@@ -569,3 +623,71 @@ class RoomScene(Scene):
             ry = y + 50 + (len(members) + i) * 38
             ui.rect(surf, ui.LINE, (x + 16, ry, 26, 26), 7, 2)
             ui.text(surf, "empty seat", x + 52, ry + 13, 14, ui.FAINT, anchor="midleft")
+
+
+class InviteDialog:
+    """Pick players from the lobby and invite them to your room (a modal window)."""
+
+    def __init__(self, app):
+        self.app = app
+        self.closed = False
+        self.w, self.h = 540, 470
+        self.x, self.y = ui.W / 2 - self.w / 2, ui.H / 2 - self.h / 2
+        self.list = ui.ListView(self.x + 24, self.y + 96, self.w - 48, self.h - 186, 54, self._draw_row,
+                                key=lambda u: u["name"], on_select=self._invite,
+                                empty_text="Nobody is waiting in the lobby right now.")
+        self.close_btn = ui.Button(self.x + self.w - 154, self.y + self.h - 72, 130, 50, "Close",
+                                   self._close, "light", 16)
+        self.sent: dict[str, float] = {}
+
+    def _close(self):
+        self.closed = True
+
+    def _candidates(self):
+        online = self.app.lobby_scene.lobby.get("online", [])
+        return [u for u in online if not u["room"] and u["name"] != self.app.username]
+
+    def _invite(self, user):
+        name = user["name"]
+        if time.monotonic() - self.sent.get(name, -99) < 5:                 # client-side rate limit
+            self.app.toast(f"You just invited {name} - give them a moment.", "warn")
+            return
+        self.sent[name] = time.monotonic()
+        self.app.send({"type": "invite", "to": name})
+
+    def _draw_row(self, surf, user, r, selected, hovered):
+        x, y, w, h = r
+        if hovered:
+            ui.rect(surf, ui.CARD_ALT, (x, y + 3, w - 8, h - 6), 12)
+        ui.block_character(surf, x + 12, y + 13, 28, sum(map(ord, user["name"])) % 4)
+        ui.text(surf, user["name"], x + 52, y + h / 2, 17, ui.INK, bold=True, anchor="midleft")
+        recently = time.monotonic() - self.sent.get(user["name"], -99) < 5
+        label, color = ("Sent", ui.GREEN) if recently else ("Invite", ui.ORANGE)
+        bw = 88
+        ui.rect(surf, color, (x + w - 20 - bw, y + 11, bw, h - 22), 10)
+        ui.text(surf, label, x + w - 20 - bw / 2, y + h / 2, 14, ui.WHITE, bold=True, anchor="center")
+
+    def handle(self, ev, pos):
+        if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+            self._close()
+            return True
+        self.list.handle(ev, pos) or self.close_btn.handle(ev, pos)
+        return True
+
+    def update(self, dt, pos):
+        room = self.app.room or {}
+        if room.get("phase") != "waiting" or not room.get("missing"):
+            self._close()           # the room filled up or the game started
+        self.list.set_items(self._candidates())
+        self.list.update(dt, pos)
+        self.close_btn.update(dt, pos)
+
+    def draw(self, surf):
+        ui.rect_a(surf, (15, 23, 42, 150), (-200, -200, ui.W + 400, ui.H + 400))
+        ui.card(surf, (self.x, self.y, self.w, self.h), radius=22)
+        room = self.app.room or {}
+        ui.text(surf, "Invite friends", self.x + 28, self.y + 24, 24, ui.INK, bold=True)
+        ui.text(surf, f"Players in the lobby  \u00b7  your room needs {room.get('missing', 0)} more",
+                self.x + 28, self.y + 60, 14, ui.MUTED)
+        self.list.draw(surf)
+        self.close_btn.draw(surf)

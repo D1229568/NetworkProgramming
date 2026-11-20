@@ -2,41 +2,51 @@
 
 Threads:
   * accept thread      - accepts TCP connections, one ClientHandler each
-  * per client: reader - decodes frames and dispatches them
+  * per client: reader - TLS handshake, then decodes frames and dispatches them
                 writer - sends queued messages (so a slow client never blocks the game)
   * tick thread        - advances every room 60 times per second, broadcasts state
   * monitor thread     - heartbeat: drops clients that have been silent too long
+  * discovery thread   - answers UDP broadcast "is there a server?" requests on the LAN
   * console thread     - admin commands typed into the server window (status, kick, quit)
 
-All shared state (sessions, rooms) is protected by one re-entrant lock.
+All shared state (sessions, rooms, invitations) is protected by one re-entrant lock.
 """
 from __future__ import annotations
 
 import argparse
 import os
+import secrets
 import socket
+import ssl
 import sys
 import threading
 import time
 import traceback
 from collections import deque
 
+from common import discovery as D
 from common import protocol as P
+from common.transport import PlainTransport, TlsTransport, fingerprint, server_context
 
+from .certgen import ensure_certificate
 from .levels import LEVELS
 from .room import WAITING, Room
 from .users import UserDB
 
 MAX_SEND_QUEUE = 500
 LOBBY_BROADCAST_INTERVAL = 0.2
+INVITE_TTL = 30.0
+INVITE_COOLDOWN = 5.0
+DISCOVERY_REPLIES_PER_SECOND = 20
 
 
 class ClientHandler:
     """One connected TCP client."""
 
-    def __init__(self, server: "GameServer", sock: socket.socket, addr):
+    def __init__(self, server: "GameServer", sock: socket.socket, addr, transport):
         self.server = server
         self.sock = sock
+        self.transport = transport
         self.addr = f"{addr[0]}:{addr[1]}"
         self.user: str | None = None
         self.last_recv = time.monotonic()
@@ -44,6 +54,7 @@ class ClientHandler:
         self._cond = threading.Condition()
         self._queue: deque[bytes] = deque()
         self._state: bytes | None = None
+        self._ready = False         # True after the TLS handshake
         self._closing = False       # graceful: flush the queue, then close
         self._closed = False
 
@@ -75,7 +86,8 @@ class ClientHandler:
     def _write_loop(self):
         while True:
             with self._cond:
-                while not self._queue and self._state is None and not self._closing and not self._closed:
+                while not self._closed and (not self._ready or
+                                            (not self._queue and self._state is None and not self._closing)):
                     self._cond.wait()
                 if self._closed:
                     return
@@ -85,10 +97,10 @@ class ClientHandler:
                 closing = self._closing
             try:
                 for data in batch:
-                    self.sock.sendall(data)
+                    self.transport.sendall(data)
                 if state is not None and not closing:
-                    self.sock.sendall(state)
-            except OSError:
+                    self.transport.sendall(state)
+            except (OSError, ssl.SSLError):
                 self.abort("send failed")
                 return
             if closing:
@@ -99,8 +111,16 @@ class ClientHandler:
     def _read_loop(self):
         decoder = P.FrameDecoder()
         try:
+            try:
+                self.transport.handshake()
+            except (OSError, ssl.SSLError, ConnectionError) as exc:
+                self.close_reason = f"TLS handshake failed ({exc.__class__.__name__}) - client without TLS?"
+                return
+            with self._cond:
+                self._ready = True
+                self._cond.notify()
             while True:
-                data = self.sock.recv(65536)
+                data = self.transport.recv()
                 if not data:
                     if not self._closed:
                         self.close_reason = "client closed the connection"
@@ -110,7 +130,7 @@ class ClientHandler:
                     self.server.dispatch(self, msg)
         except P.ProtocolError as exc:
             self.close_reason = f"protocol error: {exc}"
-        except OSError as exc:
+        except (OSError, ssl.SSLError) as exc:
             if not self._closed:
                 self.close_reason = f"connection error ({exc.__class__.__name__})"
         finally:
@@ -135,42 +155,56 @@ class ClientHandler:
                 return
             self._closed = True
             self._cond.notify_all()
-        try:
-            self.sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        try:
-            self.sock.close()
-        except OSError:
-            pass
+        self.transport.close()
 
 
 class GameServer:
     def __init__(self, host="0.0.0.0", port=P.DEFAULT_PORT, data_dir=None,
                  heartbeat_timeout=P.HEARTBEAT_TIMEOUT, reconnect_timeout=P.RECONNECT_TIMEOUT,
-                 countdown_seconds=3.0, level_clear_seconds=4.0, verbose=True):
+                 countdown_seconds=3.0, level_clear_seconds=4.0, verbose=True,
+                 tls=True, cert_file=None, key_file=None,
+                 discovery=True, discovery_port=D.DISCOVERY_PORT, name=None):
         self.host, self.port = host, port
-        data_dir = data_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-        self.users = UserDB(os.path.join(data_dir, "users.json"))
+        self.data_dir = data_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+        self.users = UserDB(os.path.join(self.data_dir, "users.json"))
         self.heartbeat_timeout = heartbeat_timeout
         self.reconnect_timeout = reconnect_timeout
         self.countdown_seconds = countdown_seconds
         self.level_clear_seconds = level_clear_seconds
         self.verbose = verbose
+        self.tls = tls
+        self.cert_file, self.key_file = cert_file, key_file
+        self.fingerprint: str | None = None
+        self._ssl_context = None
+        self.discovery = discovery
+        self.discovery_port = discovery_port
+        self.name = name or f"{socket.gethostname()}'s server"
+        self.server_id = secrets.token_hex(4)
 
         self.lock = threading.RLock()
         self.handlers: set[ClientHandler] = set()
         self.sessions: dict[str, ClientHandler] = {}     # logged-in users
         self.rooms: dict[int, Room] = {}
         self.user_room: dict[str, int] = {}              # username -> room id
+        self.invites: dict[tuple, dict] = {}             # (invitee, room id) -> invitation
         self._next_room_id = 1
         self._lobby_dirty = True
         self._last_lobby = 0.0
         self.running = False
         self._listener: socket.socket | None = None
+        self._udp: socket.socket | None = None
 
     # -------------------------------------------------------------- lifecycle
     def start(self):
+        if self.tls:
+            if not (self.cert_file and self.key_file):
+                self.cert_file, self.key_file, created = ensure_certificate(self.data_dir)
+                if created:
+                    self.log("Created a new self-signed TLS certificate in " + self.data_dir)
+            self._ssl_context = server_context(self.cert_file, self.key_file)
+            with open(self.cert_file, encoding="ascii") as f:
+                self.fingerprint = fingerprint(ssl.PEM_cert_to_DER_cert(f.read()))
+
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         if os.name != "nt":
             self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -178,18 +212,40 @@ class GameServer:
         self._listener.listen(32)
         self.port = self._listener.getsockname()[1]
         self.running = True
-        for target, name in ((self._accept_loop, "accept"), (self._tick_loop, "tick"),
-                             (self._monitor_loop, "heartbeat")):
+        threads = [(self._accept_loop, "accept"), (self._tick_loop, "tick"), (self._monitor_loop, "heartbeat")]
+        if self.discovery and self._open_discovery_socket():
+            threads.append((self._discovery_loop, "discovery"))
+        for target, name in threads:
             threading.Thread(target=target, name=name, daemon=True).start()
-        self.log(f"Server listening on {self.host}:{self.port} (TCP)")
+
+        self.log(f"Server '{self.name}' listening on {self.host}:{self.port} (TCP)")
+        if self.tls:
+            self.log("TLS is ON. Certificate SHA-256 fingerprint:")
+            self.log("   " + self.fingerprint)
+        else:
+            self.log("TLS is OFF (--no-tls): passwords and messages travel as plain text!")
+        if self._udp is not None:
+            self.log(f"LAN discovery answering on UDP port {self.discovery_port}")
+
+    def _open_discovery_socket(self) -> bool:
+        try:
+            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp.bind(("" if self.host == "0.0.0.0" else self.host, self.discovery_port))
+        except OSError as exc:
+            self.log(f"LAN discovery disabled: cannot use UDP port {self.discovery_port} ({exc})")
+            return False
+        self._udp = udp
+        self.discovery_port = udp.getsockname()[1]
+        return True
 
     def stop(self):
         self.running = False
-        if self._listener:
-            try:
-                self._listener.close()
-            except OSError:
-                pass
+        for sock in (self._listener, self._udp):
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
         with self.lock:
             handlers = list(self.handlers)
         for h in handlers:
@@ -209,12 +265,16 @@ class GameServer:
             except OSError:
                 break
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)   # low latency
-            handler = ClientHandler(self, sock, addr)
+            if self.tls:
+                transport = TlsTransport(sock, self._ssl_context, server_side=True)
+            else:
+                transport = PlainTransport(sock)
+            handler = ClientHandler(self, sock, addr, transport)
             with self.lock:
                 self.handlers.add(handler)
             handler.start()
-            handler.send({"type": "hello", "version": P.PROTOCOL_VERSION,
-                          "server": "Co-op Block Adventure"})
+            handler.send({"type": "hello", "version": P.PROTOCOL_VERSION, "server": "Co-op Block Adventure",
+                          "name": self.name, "tls": self.tls})
             self.log(f"Connection from {handler.addr}")
 
     def _tick_loop(self):
@@ -245,10 +305,43 @@ class GameServer:
             now = time.monotonic()
             with self.lock:
                 silent = [h for h in self.handlers if now - h.last_recv > self.heartbeat_timeout]
+                for key in [k for k, inv in self.invites.items() if now > inv["expires"]]:
+                    del self.invites[key]
             for h in silent:
                 self.log(f"Heartbeat timeout: {h.user or h.addr} silent for "
                          f"{now - h.last_recv:.1f} s")
                 h.abort("heartbeat timeout")
+
+    def discovery_info(self) -> dict:
+        with self.lock:
+            open_rooms = sum(1 for r in self.rooms.values() if r.phase == WAITING and r.missing > 0)
+            return {"id": self.server_id, "name": self.name, "port": self.port, "tls": self.tls,
+                    "fingerprint": self.fingerprint, "version": P.PROTOCOL_VERSION,
+                    "players": len(self.sessions), "rooms": len(self.rooms), "open_rooms": open_rooms}
+
+    def _discovery_loop(self):
+        """Answer 'is there a server?' broadcasts (UDP), with a small per-sender rate limit."""
+        budget: dict[str, list] = {}
+        while self.running:
+            try:
+                data, addr = self._udp.recvfrom(D.MAX_DATAGRAM + 1)
+            except OSError:
+                if not self.running:
+                    return
+                continue            # Windows reports ICMP errors from earlier replies here
+            if not D.is_request(data):
+                continue
+            now = time.monotonic()
+            window = budget.setdefault(addr[0], [now, 0])
+            if now - window[0] > 1.0:
+                window[0], window[1] = now, 0
+            window[1] += 1
+            if window[1] > DISCOVERY_REPLIES_PER_SECOND:
+                continue
+            try:
+                self._udp.sendto(D.make_reply(self.discovery_info()), addr)
+            except OSError:
+                pass
 
     # --------------------------------------------------------------- dispatch
     def dispatch(self, h: ClientHandler, msg: dict):
@@ -273,6 +366,10 @@ class GameServer:
         except Exception:
             traceback.print_exc()
             h.send({"type": "error", "msg": "Internal server error"})
+
+    @staticmethod
+    def notice(h: ClientHandler, text: str, kind: str = "info"):
+        h.send({"type": "notice", "text": text, "kind": kind})
 
     # ---------------------------------------------------------- accounts
     def _on_register(self, h, msg):
@@ -370,16 +467,22 @@ class GameServer:
         room.add_member(h.user, h)
         self.mark_lobby_dirty()
 
+    def _join_error(self, room: Room | None) -> str | None:
+        if room is None:
+            return "That room no longer exists"
+        if room.phase != WAITING:
+            return "That room is already playing"
+        if room.missing == 0:
+            return "That room is full"
+        return None
+
     def _on_join_room(self, h, msg):
         if self._room_of(h.user):
             return h.send({"type": "error", "msg": "You are already in a room"})
         room = self.rooms.get(msg.get("room_id"))
-        if room is None:
-            return h.send({"type": "error", "msg": "That room no longer exists"})
-        if room.phase != WAITING:
-            return h.send({"type": "error", "msg": "That room is already playing"})
-        if room.missing == 0:
-            return h.send({"type": "error", "msg": "That room is full"})
+        error = self._join_error(room)
+        if error:
+            return h.send({"type": "error", "msg": error})
         self._join(h, room)
 
     def _on_quick_match(self, h, msg):
@@ -417,6 +520,52 @@ class GameServer:
         if self.rooms.pop(room.id, None) is not None:
             self.log(f"Room {room.id} '{room.name}' closed")
             self.mark_lobby_dirty()
+
+    # ------------------------------------------------------------ invitations
+    def _on_invite(self, h, msg):
+        """Invite an online player who is in the lobby to your (waiting) room."""
+        room = self._require_room(h)
+        if room is None:
+            return
+        to = msg.get("to")
+        target = self.sessions.get(to) if isinstance(to, str) else None
+        if to == h.user:
+            return h.send({"type": "error", "msg": "You cannot invite yourself"})
+        if room.phase != WAITING or room.missing == 0:
+            return h.send({"type": "error", "msg": "Your room is full or already playing"})
+        if target is None:
+            return h.send({"type": "error", "msg": f"{to} is not online"})
+        if self._room_of(to):
+            return h.send({"type": "error", "msg": f"{to} is already in a room"})
+        now = time.monotonic()
+        key = (to, room.id)
+        previous = self.invites.get(key)
+        if previous and previous["from"] == h.user and now - previous["sent"] < INVITE_COOLDOWN:
+            return h.send({"type": "error", "msg": f"You just invited {to} - give them a moment"})
+        self.invites[key] = {"from": h.user, "sent": now, "expires": now + INVITE_TTL}
+        target.send({"type": "invite", "from": h.user, "room_id": room.id, "room_name": room.name,
+                     "size": room.size, "count": len(room.members), "level": room.selected + 1,
+                     "expires_in": INVITE_TTL})
+        self.notice(h, f"Invitation sent to {to}.", "ok")
+        self.log(f"{h.user} invited {to} to room {room.id}")
+
+    def _on_invite_reply(self, h, msg):
+        key = (h.user, msg.get("room_id"))
+        invite = self.invites.pop(key, None)
+        if invite is None or time.monotonic() > invite["expires"]:
+            return h.send({"type": "error", "msg": "That invitation has expired"})
+        inviter = self.sessions.get(invite["from"])
+        if msg.get("accept") is not True:
+            if inviter is not None:
+                self.notice(inviter, f"{h.user} declined your invitation.", "warn")
+            return
+        if self._room_of(h.user):
+            return h.send({"type": "error", "msg": "You are already in a room"})
+        room = self.rooms.get(key[1])
+        error = self._join_error(room)
+        if error:
+            return h.send({"type": "error", "msg": error})
+        self._join(h, room)
 
     # ------------------------------------------------------- in-room actions
     def _require_room(self, h) -> Room | None:
@@ -485,13 +634,21 @@ class GameServer:
 
     # -------------------------------------------------------------- console
     def status_text(self) -> str:
+        def kb(n):
+            return f"{n / 1024:.1f} KB" if n < 1024 * 1024 else f"{n / 1048576:.2f} MB"
+
         with self.lock:
             lines = [f"=== {time.strftime('%H:%M:%S')}  connections: {len(self.handlers)}, "
                      f"online: {len(self.sessions)}, rooms: {len(self.rooms)}, "
-                     f"games in progress: {sum(1 for r in self.rooms.values() if r.in_game)} ==="]
-            for name in sorted(self.sessions):
-                rid = self.user_room.get(name)
-                lines.append(f"  user {name:<16} {'room %d' % rid if rid else 'lobby'}")
+                     f"games in progress: {sum(1 for r in self.rooms.values() if r.in_game)} ===",
+                     f"  TLS: {'on, fingerprint ' + self.fingerprint[:23] + '...' if self.tls else 'OFF'}"
+                     f"   discovery: {'UDP ' + str(self.discovery_port) if self._udp else 'off'}"]
+            for h in sorted(self.handlers, key=lambda x: x.user or "~"):
+                rid = self.user_room.get(h.user) if h.user else None
+                who = h.user or "(not logged in)"
+                where = f"room {rid}" if rid else "lobby" if h.user else ""
+                lines.append(f"  user {who:<16} {where:<8} from {h.addr:<21} "
+                             f"in {kb(h.transport.bytes_in):>9}  out {kb(h.transport.bytes_out):>9}")
             for room in sorted(self.rooms.values(), key=lambda r: r.id):
                 level = (f"playing level {room.level_index + 1}" if room.world
                          else f"selected level {room.selected + 1}")
@@ -536,10 +693,14 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Co-op Block Adventure server")
     parser.add_argument("--host", default="0.0.0.0", help="interface to listen on (default: all)")
     parser.add_argument("--port", type=int, default=P.DEFAULT_PORT)
-    parser.add_argument("--data", default=None, help="folder for users.json")
+    parser.add_argument("--data", default=None, help="folder for users.json and the TLS certificate")
+    parser.add_argument("--name", default=None, help="server name shown to players on the LAN")
+    parser.add_argument("--no-tls", action="store_true", help="plain TCP without encryption (for demos)")
+    parser.add_argument("--no-discovery", action="store_true", help="do not answer LAN discovery (UDP)")
     args = parser.parse_args(argv)
 
-    server = GameServer(args.host, args.port, args.data)
+    server = GameServer(args.host, args.port, args.data, tls=not args.no_tls,
+                        discovery=not args.no_discovery, name=args.name)
     server.start()
     threading.Thread(target=server.console, name="console", daemon=True).start()
     try:

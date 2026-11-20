@@ -4,8 +4,10 @@ __pycache__/
 .venv/
 venv/
 
-# Runtime data created by the server (accounts, password hashes, progress)
+# Runtime data: server accounts, password hashes, progress, TLS private key;
+# client list of trusted server certificates
 server/data/
+client/data/
 
 # Editors / OS
 .vscode/

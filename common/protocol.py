@@ -17,7 +17,7 @@ import json
 import re
 import struct
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 50555

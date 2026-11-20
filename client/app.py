@@ -26,7 +26,8 @@ import pygame  # noqa: E402
 from common import protocol as P  # noqa: E402
 
 from . import ui  # noqa: E402
-from .network import Connection  # noqa: E402
+from .netstats import NetStats  # noqa: E402
+from .network import Connection, KnownServers, discover_async  # noqa: E402
 from .scenes import LobbyScene, LoginScene, RoomScene  # noqa: E402
 
 MAX_RECONNECT_ATTEMPTS = 20
@@ -61,6 +62,12 @@ class App:
         self.events: queue.Queue = queue.Queue()
         self.conn: Connection | None = None
         self.server_addr = (host, port)
+        self.use_tls = True
+        self.known = KnownServers()
+        self.stats = NetStats()
+        self.scanning = False
+        self._invites: list[dict] = []
+        self._invite_modal = None
         self.username: str | None = None
         self._password: str | None = None
         self._pending_password: str | None = None
@@ -116,6 +123,14 @@ class App:
     def toast(self, text, kind="info"):
         self.toasts.push(text, kind)
 
+    def open_modal(self, modal):
+        self.modal = modal
+
+    def start_discovery(self):
+        if not self.scanning:
+            self.scanning = True
+            discover_async(self.events)
+
     def confirm(self, title, message, ok_label, on_ok):
         self.modal = ui.Modal(title, message, [("Cancel", "light", None), (ok_label, "danger", on_ok)])
 
@@ -138,8 +153,15 @@ class App:
                 self._event(ev, pos)
             self._poll_network()
             self._run_timers()
+            if self.modal and self.modal is self._invite_modal and time.monotonic() > self._invite_modal.deadline:
+                self.modal = self._invite_modal = None
+                self.toast("The invitation expired.", "warn")
+            if self.modal is None:
+                self._show_next_invite()
             if self.modal:
                 self.modal.update(dt, pos)
+                if self.modal.closed:
+                    self.modal = None
             self.scene.update(dt, pos)
             self._draw(dt)
             pygame.display.flip()
@@ -155,6 +177,9 @@ class App:
             return
         if ev.type == pygame.WINDOWFOCUSLOST:
             self.room_scene.game.release_all()
+            return
+        if ev.type == pygame.KEYDOWN and ev.key == pygame.K_F3:
+            self.stats.visible = not self.stats.visible
             return
         if hasattr(ev, "pos") and ev.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION):
             pos = ui.to_logical(*ev.pos)
@@ -202,6 +227,7 @@ class App:
                     54, 23, 16, ui.WHITE, bold=True, anchor="midleft")
             self._giveup_btn.draw(self.screen)
         self._draw_status_bar()
+        self.stats.draw(self.screen, self)
         self.toasts.draw(self.screen)
         if self.modal:
             self.modal.draw(self.screen)
@@ -209,8 +235,10 @@ class App:
     def _draw_status_bar(self):
         y = ui.H - 24
         ui.rect_a(self.screen, (15, 23, 42, 170), (0, y, ui.W, 24))
+        ui.text(self.screen, "F3  network stats", ui.W - 12, y + 12, 13, (148, 163, 184), anchor="midright")
         if self.conn and self.conn.alive:
-            parts = [f"Connected to {self.server_addr[0]}:{self.server_addr[1]} (TCP)"]
+            secure = "TCP + TLS, encrypted" if self.conn.tls else "TCP, NOT encrypted"
+            parts = [f"Connected to {self.server_addr[0]}:{self.server_addr[1]} ({secure})"]
             if self.ping_ms is not None:
                 parts.append(f"ping {self.ping_ms:.0f} ms")
             if self.logged_in:
@@ -229,18 +257,21 @@ class App:
         if self.conn is not None:
             self.conn.close()
         self.server_addr = (host, port)
-        self.conn = Connection(self.events)
+        self.conn = Connection(self.events, tls=self.use_tls, known=self.known)
         self._after_connect = then
         self.status_note = f"connecting to {host}:{port}..."
         self.conn.connect_async(host, port)
 
     def _with_connection(self, host, port, then):
-        if self.conn and self.conn.alive and self.server_addr == (host, port):
+        if (self.conn and self.conn.alive and self.server_addr == (host, port)
+                and self.conn.tls == self.use_tls):
             then()
         else:
             self._connect(host, port, then)
 
     def login(self, host, port, user, password):
+        self._pending_login = (host, port, user, password)
+
         def go():
             self._pending_password = password
             self.send({"type": "login", "username": user, "password": password})
@@ -259,6 +290,10 @@ class App:
                 kind, conn_id, payload = self.events.get_nowait()
             except queue.Empty:
                 return
+            if kind == "discovered":
+                self.scanning = False
+                self.login_scene.on_discovered(payload)
+                continue
             if self.conn is None or conn_id != self.conn.id:
                 continue                        # event from an old connection
             if kind == "msg":
@@ -267,6 +302,8 @@ class App:
                     handler(payload)
             elif kind == "connected":
                 self.status_note = ""
+                if self.conn.first_trust:
+                    self.toast(f"New server trusted. Certificate {self.conn.fingerprint[:23]}...", "ok")
                 then, self._after_connect = self._after_connect, None
                 if then:
                     then()
@@ -274,11 +311,16 @@ class App:
                 self.conn = None
                 self._on_connect_failed(payload)
             elif kind == "closed":
-                self.conn = None
+                conn, self.conn = self.conn, None
+                if not self.logged_in and not self.reconnecting and conn.msgs_in == 0 and not conn.tls:
+                    self.login_scene.show_error("The server hung up without answering. It probably uses TLS - "
+                                                "switch 'Encrypted (TLS)' on.")
+                    continue
                 self._on_connection_lost(payload)
 
     def _heartbeat(self):
         conn = self.conn
+        self.stats.sample(conn)
         if conn and conn.alive:
             conn.send({"type": "ping", "t": time.time()})
             silent = time.monotonic() - conn.last_recv
@@ -287,7 +329,9 @@ class App:
 
     def _on_connect_failed(self, error):
         self.status_note = ""
-        if self.reconnecting:
+        if isinstance(error, dict) and error.get("kind") == "fingerprint":
+            self._certificate_changed(error)
+        elif self.reconnecting:
             self._schedule_reconnect()
         else:
             self.login_scene.show_error(f"Cannot connect to {self.server_addr[0]}:{self.server_addr[1]} - {error}")
@@ -299,6 +343,27 @@ class App:
             self._start_reconnect(reason)
         else:
             self.status_note = f"disconnected ({reason})"
+
+    def _certificate_changed(self, info):
+        """The server presented a different certificate than last time: stop and ask."""
+        was_reconnecting = self.reconnecting
+        self._end_reconnect()
+        pending = getattr(self, "_pending_login", None)
+        if was_reconnecting:
+            self._to_login()
+        self.login_scene.message = ("", ui.MUTED)
+
+        def trust():
+            self.known.set(info["server"], info["got"])
+            if pending:
+                self.login(*pending)
+
+        self.modal = ui.Modal(
+            "Server identity changed!",
+            f"The TLS certificate of {info['server']} is not the one this computer saw before. "
+            "Someone could be pretending to be the server (man-in-the-middle). Only continue if the "
+            f"server was reinstalled.  New: {info['got'][:23]}...",
+            [("Cancel", "light", None), ("Trust new certificate", "danger", trust)])
 
     # ---------------------------------------------------------- reconnecting
     def _start_reconnect(self, reason):
@@ -366,6 +431,33 @@ class App:
     def on_pong(self, msg):
         if isinstance(msg.get("t"), (int, float)):
             self.ping_ms = (time.time() - msg["t"]) * 1000
+            self.stats.on_ping(self.ping_ms)
+
+    def on_notice(self, msg):
+        self.toast(msg.get("text", ""), msg.get("kind", "info"))
+
+    def on_invite(self, msg):
+        msg["deadline"] = time.monotonic() + float(msg.get("expires_in", 30)) - 1
+        self._invites.append(msg)
+
+    def _show_next_invite(self):
+        while self._invites and self.logged_in:
+            inv = self._invites.pop(0)
+            if time.monotonic() > inv["deadline"] or self.room is not None:
+                continue
+
+            def reply(accept, inv=inv):
+                self._invite_modal = None
+                self.send({"type": "invite_reply", "room_id": inv["room_id"], "accept": accept})
+
+            modal = ui.Modal(
+                "Room invitation",
+                f"{inv['from']} invites you to the room \"{inv['room_name']}\" "
+                f"({inv['count']}/{inv['size']} players, level {inv['level']} selected). Join now?",
+                [("Decline", "light", lambda: reply(False)), ("Join", "success", lambda: reply(True))])
+            modal.deadline = inv["deadline"]
+            self.modal = self._invite_modal = modal
+            return
 
     def on_register_result(self, msg):
         self.login_scene.on_register_result(msg)
@@ -381,6 +473,8 @@ class App:
             return
         was_reconnecting = self.reconnecting
         self._end_reconnect()
+        if was_reconnecting:
+            self.stats.reconnects += 1
         self.logged_in = True
         self.username = msg["username"]
         self._password = self._pending_password
@@ -428,6 +522,7 @@ class App:
         self.room_scene.game.load_level(msg)
 
     def on_state(self, msg):
+        self.stats.on_snapshot()
         self.room_scene.game.on_state(msg)
 
     def on_level_result(self, msg):

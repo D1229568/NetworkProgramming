@@ -13,6 +13,7 @@ import socket
 import time
 
 from common import protocol as P
+from common.transport import PlainTransport, TlsTransport, client_context
 
 
 def main(argv=None):
@@ -23,13 +24,19 @@ def main(argv=None):
     parser.add_argument("--password", default="botpass")
     parser.add_argument("--size", type=int, default=None, help="room size for quick match")
     parser.add_argument("--room", type=int, default=None, help="join this room id instead")
+    parser.add_argument("--no-tls", action="store_true", help="for a server started with --no-tls")
     args = parser.parse_args(argv)
 
     sock = socket.create_connection((args.host, args.port))
+    if args.no_tls:
+        transport = PlainTransport(sock)
+    else:
+        transport = TlsTransport(sock, client_context(), server_side=False)
+        transport.handshake()
     decoder = P.FrameDecoder()
 
     def send(**msg):
-        sock.sendall(P.encode(msg))
+        transport.sendall(P.encode(msg))
 
     send(type="register", username=args.user, password=args.password)
     send(type="login", username=args.user, password=args.password)
@@ -43,7 +50,7 @@ def main(argv=None):
                 last_ping = time.monotonic()
                 send(type="ping", t=time.time())
             try:
-                data = sock.recv(65536)
+                data = transport.recv()
             except socket.timeout:
                 continue
             if not data:

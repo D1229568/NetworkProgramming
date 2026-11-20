@@ -1,17 +1,33 @@
-"""End-to-end tests: a real server on a random port and raw TCP clients."""
+"""End-to-end tests: a real server on a random port and raw TCP (+TLS) clients."""
+import shutil
 import socket
+import ssl
 import tempfile
 import threading
 import time
 import unittest
 
 from common import protocol as P
+from common.transport import PlainTransport, TlsTransport, client_context
+from server.certgen import ensure_certificate
 from server.server import GameServer
+
+CERT_DIR = tempfile.mkdtemp()
+CERT_FILE, KEY_FILE, _ = ensure_certificate(CERT_DIR)        # generated once for all tests
 
 
 class RawClient:
-    def __init__(self, port):
+    def __init__(self, port, tls=True):
         self.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        if tls:
+            self.transport = TlsTransport(self.sock, client_context(), server_side=False)
+            try:
+                self.transport.handshake()
+            except Exception:
+                self.sock.close()
+                raise
+        else:
+            self.transport = PlainTransport(self.sock)
         self.decoder = P.FrameDecoder()
         self.inbox = []
         self.keepalive = True
@@ -25,19 +41,21 @@ class RawClient:
             if self.keepalive:
                 try:
                     self.send(type="ping", t=time.time())
-                except OSError:
+                except (OSError, ssl.SSLError):
                     return
 
     def send(self, **msg):
         with self._lock:
-            self.sock.sendall(P.encode(msg))
+            self.transport.sendall(P.encode(msg))
 
     def _pump(self, timeout):
         self.sock.settimeout(timeout)
         try:
-            data = self.sock.recv(65536)
+            data = self.transport.recv()
         except socket.timeout:
             return True
+        except (OSError, ssl.SSLError) as exc:
+            raise ConnectionError(str(exc)) from exc
         if not data:
             raise ConnectionError("server closed the connection")
         self.inbox.extend(self.decoder.feed(data))
@@ -78,7 +96,8 @@ class ServerTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.server = GameServer("127.0.0.1", 0, self.tmp.name, heartbeat_timeout=1.5,
                                  reconnect_timeout=2.0, countdown_seconds=0.2,
-                                 level_clear_seconds=0.2, verbose=False)
+                                 level_clear_seconds=0.2, verbose=False,
+                                 cert_file=CERT_FILE, key_file=KEY_FILE, discovery=False)
         self.server.start()
         self.clients = []
 
@@ -290,6 +309,174 @@ class ServerTest(unittest.TestCase):
         time.sleep(0.3)
         later = a.wait(lambda m: m.get("type") == "state")
         self.assertEqual(next(p["x"] for p in later["players"] if p["n"] == "alice"), x0)
+
+    # ------------------------------------------------------------ invitations
+    def test_invite_accept_and_decline(self):
+        a, b, c = self.client(), self.client(), self.client()
+        a.login("alice")
+        b.login("bob")
+        c.login("carol")
+        a.send(type="create_room", name="party", size=3)
+        room = a.wait_type("room")
+        a.send(type="invite", to="bob")
+        self.assertIn("sent", a.wait_type("notice")["text"])
+        invite = b.wait_type("invite")
+        self.assertEqual((invite["from"], invite["room_id"], invite["count"], invite["size"]),
+                         ("alice", room["id"], 1, 3))
+        b.send(type="invite_reply", room_id=room["id"], accept=True)
+        joined = b.wait_type("room")
+        self.assertEqual([m["name"] for m in joined["members"]], ["alice", "bob"])
+
+        a.send(type="invite", to="carol")
+        c.send(type="invite_reply", room_id=c.wait_type("invite")["room_id"], accept=False)
+        a.wait(lambda m: m.get("type") == "notice" and "carol declined" in m["text"], what="decline notice")
+
+    def test_invite_rules(self):
+        a, b, c = self.client(), self.client(), self.client()
+        a.login("alice")
+        b.login("bob")
+        c.login("carol")
+        a.send(type="invite", to="bob")
+        self.assertIn("not in a room", a.wait_type("error")["msg"])
+        a.send(type="create_room", name="r1", size=2)
+        room = a.wait_type("room")
+        b.send(type="create_room", name="r2", size=2)
+        b.wait_type("room")
+        a.send(type="invite", to="alice")
+        self.assertIn("yourself", a.wait_type("error")["msg"])
+        a.send(type="invite", to="bob")
+        self.assertIn("already in a room", a.wait_type("error")["msg"])
+        a.send(type="invite", to="nobody")
+        self.assertIn("not online", a.wait_type("error")["msg"])
+        c.send(type="invite_reply", room_id=room["id"], accept=True)
+        self.assertIn("expired", c.wait_type("error")["msg"], "cannot accept an invitation nobody sent")
+        a.send(type="invite", to="carol")
+        a.wait_type("notice")
+        a.send(type="invite", to="carol")
+        self.assertIn("moment", a.wait_type("error")["msg"], "invitations are rate limited")
+
+    def test_server_counts_traffic(self):
+        a = self.client()
+        a.login("alice")
+        with self.server.lock:
+            h = self.server.sessions["alice"]
+            self.assertGreater(h.transport.bytes_in, 100)
+            self.assertGreater(h.transport.bytes_out, 100)
+        self.assertIn("TLS: on", self.server.status_text())
+
+
+class PlainServerTest(unittest.TestCase):
+    """--no-tls mode, and what happens when client and server disagree about TLS."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.server = GameServer("127.0.0.1", 0, self.tmp.name, verbose=False, tls=False, discovery=False)
+        self.server.start()
+
+    def tearDown(self):
+        self.server.stop()
+        self.tmp.cleanup()
+
+    def test_plaintext_login_works(self):
+        c = RawClient(self.server.port, tls=False)
+        self.assertFalse(c.wait_type("hello")["tls"])
+        self.assertTrue(c.login("alice")["ok"])
+        c.close()
+
+    def test_tls_client_cannot_talk_to_plain_server(self):
+        with self.assertRaises((ssl.SSLError, ConnectionError, OSError)):
+            RawClient(self.server.port, tls=True)
+
+
+class TlsServerTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.server = GameServer("127.0.0.1", 0, self.tmp.name, verbose=False, discovery=False,
+                                 cert_file=CERT_FILE, key_file=KEY_FILE)
+        self.server.start()
+
+    def tearDown(self):
+        self.server.stop()
+        self.tmp.cleanup()
+
+    def test_plain_client_is_rejected_by_tls_server(self):
+        c = RawClient(self.server.port, tls=False)
+        c.send(type="login", username="alice", password="secret")
+        with self.assertRaises(ConnectionError):
+            c.wait_type("login_result", timeout=8)
+        c.close()
+
+    def test_client_pins_the_certificate(self):
+        import queue
+        from client.network import Connection, KnownServers
+
+        known = KnownServers(f"{self.tmp.name}/known.json")
+        events = queue.Queue()
+
+        def connect():
+            conn = Connection(events, tls=True, known=known)
+            conn.connect_async("127.0.0.1", self.server.port)
+            kind, _, payload = events.get(timeout=5)
+            return conn, kind, payload
+
+        conn, kind, _ = connect()
+        self.assertEqual(kind, "connected")
+        self.assertTrue(conn.first_trust)
+        self.assertEqual(known.get(f"127.0.0.1:{self.server.port}"), self.server.fingerprint)
+        self.assertIn("TLS", conn.description())
+        conn.close()
+        known.set(f"127.0.0.1:{self.server.port}", "00:11:22")       # pretend we saw another certificate
+        conn, kind, payload = connect()
+        self.assertEqual(kind, "connect_failed")
+        self.assertEqual(payload["kind"], "fingerprint")
+        self.assertEqual(payload["got"], self.server.fingerprint)
+
+
+class DiscoveryTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.server = GameServer("127.0.0.1", 0, self.tmp.name, verbose=False, discovery_port=0,
+                                 cert_file=CERT_FILE, key_file=KEY_FILE, name="Test server")
+        self.server.start()
+
+    def tearDown(self):
+        self.server.stop()
+        self.tmp.cleanup()
+
+    def test_udp_discovery_finds_the_server(self):
+        from common import discovery
+        found = discovery.discover(timeout=0.8, port=self.server.discovery_port, targets=["127.0.0.1"])
+        self.assertEqual(len(found), 1)
+        info = found[0]
+        self.assertEqual((info["name"], info["port"], info["tls"], info["host"]),
+                         ("Test server", self.server.port, True, "127.0.0.1"))
+        self.assertEqual(info["fingerprint"], self.server.fingerprint)
+
+    def test_discovery_ignores_garbage_and_rate_limits(self):
+        from common import discovery
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(0.5)
+        target = ("127.0.0.1", self.server.discovery_port)
+        sock.sendto(b"hello?", target)
+        sock.sendto(b'{"magic": "something-else", "type": "discover"}', target)
+        with self.assertRaises(socket.timeout):
+            sock.recvfrom(2048)
+        for _ in range(60):
+            sock.sendto(discovery.make_request(), target)
+        replies = 0
+        try:
+            while True:
+                sock.recvfrom(2048)
+                replies += 1
+        except socket.timeout:
+            pass
+        sock.close()
+        self.assertGreater(replies, 0)
+        self.assertLessEqual(replies, 25)
+
+
+def tearDownModule():
+    shutil.rmtree(CERT_DIR, ignore_errors=True)
 
 
 if __name__ == "__main__":

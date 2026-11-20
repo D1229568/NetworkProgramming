@@ -464,6 +464,41 @@ class Segmented(Widget):
                  WHITE if selected else MUTED, bold=selected, anchor="center")
 
 
+class Toggle(Widget):
+    """An on/off switch with a label on its left."""
+
+    def __init__(self, x, y, w, h, label, value=True, on_change=None, size=13):
+        super().__init__(x, y, w, h)
+        self.label = label
+        self.value = value
+        self.on_change = on_change
+        self.size = size
+        self._pos = 1.0 if value else 0.0
+
+    def handle(self, ev, pos):
+        if not self.visible or not self.enabled:
+            return False
+        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1 and self.hit(pos):
+            self.value = not self.value
+            if self.on_change:
+                self.on_change(self.value)
+            return True
+        return False
+
+    def update(self, dt, pos):
+        self._pos += ((1.0 if self.value else 0.0) - self._pos) * min(1.0, dt * 16)
+
+    def draw(self, surf):
+        if not self.visible:
+            return
+        sw, sh = 42, 22
+        sx, sy = self.x + self.w - sw, self.y + (self.h - sh) / 2
+        text(surf, self.label, sx - 8, self.y + self.h / 2, self.size, GREEN_DARK if self.value else MUTED,
+             bold=True, anchor="midright")
+        rect(surf, mix((203, 213, 225), GREEN, self._pos), (sx, sy, sw, sh), sh / 2)
+        circle(surf, WHITE, (sx + sh / 2 + self._pos * (sw - sh), sy + sh / 2), sh / 2 - 3)
+
+
 class ListView(Widget):
     def __init__(self, x, y, w, h, row_h, draw_row, key=lambda item: item, on_select=None,
                  on_activate=None, empty_text=""):
@@ -665,7 +700,9 @@ class Modal:
     def __init__(self, title, message, buttons):
         self.title = title
         self.message = message
-        self.w, self.h = 540, 230
+        self.w = 560
+        self.lines = wrap(message, 16, self.w - 56)[:9]
+        self.h = 160 + 24 * len(self.lines)
         x, y = W / 2 - self.w / 2, H / 2 - self.h / 2
         self.box = (x, y, self.w, self.h)
         self.buttons = []
@@ -701,7 +738,7 @@ class Modal:
         x, y, w, h = self.box
         card(surf, self.box, radius=20)
         text(surf, self.title, x + 28, y + 26, 22, INK, bold=True)
-        for i, part in enumerate(wrap(self.message, 16, w - 56)[:4]):
+        for i, part in enumerate(self.lines):
             text(surf, part, x + 28, y + 70 + i * 24, 16, MUTED)
         for b in self.buttons:
             b.draw(surf)
